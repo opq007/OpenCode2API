@@ -184,7 +184,9 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 | `OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH` | `true` | 控制 `/health/details` 是否要求 Bearer 认证 |
 | `OPENCODE_METRICS_ENABLED` | `false` | 控制 `/metrics` 是否暴露 |
 | `OPENCODE_METRICS_REQUIRE_AUTH` | `true` | 控制 `/metrics` 是否要求 Bearer 认证 |
-| `USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
+| `OPENCODE_ISOLATION` | `keep-auth` | 后端沙箱隔离：`keep-auth`（默认，复制本机 `auth.json` 以转发本地已登录模型） / `full` / `none` |
+| `OPENCODE_JAIL_INLINE_KEYS` | `false` | 在 jail 配置中保留 provider 内联 `apiKey`（仅单用户主机建议开启） |
+| `USE_ISOLATED_HOME` | `(废弃)` | 旧布尔开关；`true`→`full`，`false`→`none`，已由 `OPENCODE_ISOLATION` 取代 |
 | `OPENCODE_PROXY_PROMPT_MODE` | `standard` | 提示词处理模式 |
 | `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt |
 | `OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS` | `false` | 自动清理会话存储 |
@@ -218,6 +220,7 @@ OPENCODE_METRICS_REQUIRE_AUTH=true
 OPENCODE_PROXY_PROMPT_MODE=plugin-inject
 OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=true
 OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
+OPENCODE_ISOLATION=keep-auth
 ```
 
 
@@ -274,7 +277,7 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 
 ### 请求卡住但 `/v1/models` 正常
 ```bash
-USE_ISOLATED_HOME=false  # 让 OpenCode 复用本地登录态
+OPENCODE_ISOLATION=none  # 调试：完全使用本机 opencode 主目录（默认 keep-auth 已复制 auth.json）
 ```
 
 ### 模型找不到

@@ -13,11 +13,12 @@
 | 项目 | 说明 |
 |:-----|:-----|
 | **症状** | 模型列表接口正常，但实际请求无响应 |
-| **解决方案** | 设置 `USE_ISOLATED_HOME=false` 让 OpenCode 复用本机登录态 |
+| **解决方案** | 默认 `OPENCODE_ISOLATION=keep-auth` 会复制本机 `auth.json`。若请求仍卡住，确认本机 opencode 已 `/connect` 登录；内联 `apiKey` 请改为环境变量，或仅调试时用 `none` |
 
 ```bash
-USE_ISOLATED_HOME=false
-# 或
+# 默认已是 keep-auth（复制 auth.json）。仍卡住时：
+OPENCODE_ISOLATION=none
+# 旧开关（等价于 none）：
 OPENCODE_USE_ISOLATED_HOME=false
 ```
 

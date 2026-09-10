@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Backend Isolation ("client is the agent")**: The spawned opencode backend is now sandboxed by default (`OPENCODE_ISOLATION=keep-auth`). Operator-local prompts, skills, agents, plugins, MCP servers and `AGENTS.md` no longer leak into client requests. Provider/model definitions are carried over and the real `auth.json` is copied so locally logged-in models keep working. Inline credentials in jail config are stripped (`full` skips `auth.json`; `none` uses the real home). Windows is no longer exempt. Defense-in-depth: `HOME`/`USERPROFILE`/`XDG_*` redirects, `OPENCODE_CONFIG_DIR`/`OPENCODE_CONFIG_CONTENT` pinning, and `opencode serve --pure`. Legacy `USE_ISOLATED_HOME` still maps `true`→`full` / `false`→`none`.
+
 ### Fixed
 
 - **Backend Health Check**: The opencode backend health probe now uses the correct `/global/health` endpoint (the old `/health` path fell through to the web UI catch-all and could report 200 HTML as healthy). The probe now validates the JSON `healthy` field.

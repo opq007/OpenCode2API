@@ -40,7 +40,9 @@
 | `OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH` | `true` | 控制 `/health/details` 是否要求 Bearer 认证 |
 | `OPENCODE_METRICS_ENABLED` | `false` | 控制 Prometheus `/metrics` 是否暴露 |
 | `OPENCODE_METRICS_REQUIRE_AUTH` | `true` | 控制 `/metrics` 是否要求 Bearer 认证 |
-| `USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
+| `OPENCODE_ISOLATION` | `keep-auth` | 后端沙箱隔离级别：`keep-auth` / `full` / `none`（见下文「后端隔离」） |
+| `OPENCODE_JAIL_INLINE_KEYS` | `false` | 为 `true` 时在 jail 配置中保留 provider 内联 `apiKey`（仅建议单用户主机开启） |
+| `USE_ISOLATED_HOME` | `(废弃)` | 旧布尔开关；`true`→`full`，`false`→`none`。已被 `OPENCODE_ISOLATION` 取代 |
 | `PROMPT_MODE` | `standard` | 提示词处理模式 |
 | `OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt |
 | `AUTO_CLEANUP_CONVERSATIONS` | `false` | 自动清理会话存储 |
@@ -72,6 +74,8 @@
     "INTERNAL_ALLOWED_TOOLS": ["web_fetch"],
     "INTERNAL_TOOL_METRICS_ENABLED": true,
     "INTERNAL_TOOL_DISCOVERY_FIXTURE": [],
+    "ISOLATION": "keep-auth",
+    "JAIL_INLINE_KEYS": false,
     "USE_ISOLATED_HOME": false,
     "PROMPT_MODE": "standard",
     "OMIT_SYSTEM_PROMPT": false,
@@ -86,6 +90,28 @@
 ```
 
 ---
+
+## 🛡️ 后端隔离（"客户端即 Agent"）
+
+OpenCode2API 的使用模型是：**后端 = 纯净模型路由器，客户端 = Agent**。工具执行在客户端侧完成（OpenAI 标准 tool calling 循环），因此后端不应携带任何本地 opencode 环境的"人格"（提示词、skills、agents、modes、commands、plugins、MCP servers、AGENTS.md）。
+
+默认（`OPENCODE_ISOLATION=keep-auth`）下，代理每次自动启动后端时都会：
+
+1. **重定向全部配置路径**进每次启动新建的 jail 目录（`HOME` / `USERPROFILE`、`XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_CACHE_HOME`），并让 `opencode serve` 在空工作目录中运行。操作者本地 `~/.config/opencode/` 下的 skills/agents/提示词/plugins 一个都不会被加载（已用 `opencode debug config` 实测确认）。
+2. **写入锁定配置** `opencode.json`：`instructions: []`、`autoupdate: false`、`snapshot: false`，并从真实全局配置中**只提取模型访问相关的白名单**（`provider` / `model` / `small_model` / `disabled_providers` / `enabled_providers`）——其余键（指令、agent、MCP、插件、主题……）全部丢弃。
+3. **剥离内联凭据**：jail 配置文件中的 provider `apiKey`/`token`/`secret` 等字段会被移除（防止临时目录中的配置泄露密钥）。凭据默认通过复制本机 `auth.json`（`keep-auth`）和环境变量透传获得。
+4. **纵深防御**：注入 `OPENCODE_CONFIG_DIR`（指向 jail 内空目录）与 `OPENCODE_CONFIG_CONTENT={"instructions":[]}`，确保即使有其他配置源被合并进来，指令也是空的。
+5. **`--pure` 参数**：`opencode serve --pure` 禁用外部插件。
+
+| 级别 | 说明 |
+|:-----|:-----|
+| `keep-auth` | 完全沙箱 + 复制真实 `~/.local/share/opencode/auth.json` 进 jail（默认。用于转发本机 `/connect` 已登录的模型）。 |
+| `full` | 完全沙箱。仅继承 provider/model 配置，凭据只靠环境变量。 |
+| `none` | 使用真实用户主目录（仅调试/排障用）。 |
+
+> 旧开关 `USE_ISOLATED_HOME=true/false` 仍然识别，分别等价于 `full` / `none`。新配置 `OPENCODE_ISOLATION` 优先。
+>
+> 单用户主机如果必须保留 provider 内联 `apiKey`，可设 `OPENCODE_JAIL_INLINE_KEYS=true`。
 
 ## 🛠️ 外部工具桥接
 

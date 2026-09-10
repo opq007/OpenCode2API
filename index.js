@@ -89,7 +89,10 @@ const finalConfig = {
     HEALTH_DETAILS_REQUIRE_AUTH: parseBool(process.env.OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH, parseBool(fileConfig.HEALTH_DETAILS_REQUIRE_AUTH, defaultConfig.HEALTH_DETAILS_REQUIRE_AUTH)),
     METRICS_ENABLED: parseBool(process.env.OPENCODE_METRICS_ENABLED, parseBool(fileConfig.METRICS_ENABLED, defaultConfig.METRICS_ENABLED)),
     METRICS_REQUIRE_AUTH: parseBool(process.env.OPENCODE_METRICS_REQUIRE_AUTH, parseBool(fileConfig.METRICS_REQUIRE_AUTH, defaultConfig.METRICS_REQUIRE_AUTH)),
-    USE_ISOLATED_HOME: parseBool(process.env.OPENCODE_USE_ISOLATED_HOME, parseBool(fileConfig.USE_ISOLATED_HOME, false)),
+    USE_ISOLATED_HOME: (process.env.OPENCODE_USE_ISOLATED_HOME !== undefined || fileConfig.USE_ISOLATED_HOME !== undefined)
+        ? parseBool(process.env.OPENCODE_USE_ISOLATED_HOME, parseBool(fileConfig.USE_ISOLATED_HOME, undefined))
+        : undefined,
+    ISOLATION: process.env.OPENCODE_ISOLATION || fileConfig.ISOLATION || undefined,
     REQUEST_TIMEOUT_MS: parseInt(process.env.OPENCODE_PROXY_REQUEST_TIMEOUT_MS) || fileConfig.REQUEST_TIMEOUT_MS || 180000,
     DEBUG: parseBool(process.env.OPENCODE_PROXY_DEBUG, parseBool(fileConfig.DEBUG, false)),
     ZEN_API_KEY: process.env.OPENCODE_ZEN_API_KEY || fileConfig.ZEN_API_KEY || '',
@@ -139,7 +142,7 @@ console.log(`  - Health Details Enabled: ${finalConfig.HEALTH_DETAILS_ENABLED ? 
 console.log(`  - Health Details Require Auth: ${finalConfig.HEALTH_DETAILS_REQUIRE_AUTH ? 'Yes' : 'No'}`);
 console.log(`  - Metrics Enabled: ${finalConfig.METRICS_ENABLED ? 'Yes' : 'No'}`);
 console.log(`  - Metrics Require Auth: ${finalConfig.METRICS_REQUIRE_AUTH ? 'Yes' : 'No'}`);
-console.log(`  - Use Isolated Home: ${finalConfig.USE_ISOLATED_HOME ? 'Yes' : 'No'}`);
+console.log(`  - Isolation: ${finalConfig.ISOLATION || 'keep-auth'}${finalConfig.USE_ISOLATED_HOME === undefined ? '' : ` (legacy USE_ISOLATED_HOME=${finalConfig.USE_ISOLATED_HOME})`}`);
 console.log(`  - Request Timeout: ${finalConfig.REQUEST_TIMEOUT_MS}ms`);
 console.log(`  - Prompt Mode: ${finalConfig.PROMPT_MODE}`);
 console.log(`  - Omit System Prompt: ${finalConfig.OMIT_SYSTEM_PROMPT ? 'Yes' : 'No'}`);

@@ -2996,11 +2996,177 @@ const backendState = new Map();
 /**
  * Backend Lifecycle Management
  */
+
+// --- Sandbox / isolation helpers ---------------------------------------------
+//
+// Direction A ("client is the agent"): the spawned opencode backend must act as
+// a *pristine model router*. None of the operator's local opencode environment
+// (instructions, skills, agents, modes, commands, plugins, MCP servers,
+// AGENTS.md) may influence client requests. The only reliable way to achieve
+// that is to redirect every path opencode resolves its configuration from into
+// a fresh per-instance jail directory (verified against opencode 1.18.30 via
+// `opencode debug config`: with USERPROFILE/HOME/XDG_* redirected, the merged
+// config shows agent:{}, plugin:[], instructions:[]).
+
+const ISOLATION_LEVELS = ['full', 'keep-auth', 'none'];
+
+export function normalizeIsolation(rawValue, legacyUseIsolatedHome) {
+    if (typeof rawValue === 'string') {
+        const v = rawValue.trim().toLowerCase();
+        if (ISOLATION_LEVELS.includes(v)) return v;
+    }
+    // Legacy boolean switch: USE_ISOLATED_HOME=true -> full, false -> none.
+    if (typeof legacyUseIsolatedHome === 'boolean') {
+        return legacyUseIsolatedHome ? 'full' : 'none';
+    }
+    // Default keep-auth: sandbox the local prompt/skills environment, but
+    // reuse this machine's opencode /connect credentials so forwarded models
+    // keep working.
+    return 'keep-auth';
+}
+
+const CREDENTIAL_KEY_RE = /(apikey|api[_-]?key|token|secret|password|passwd|authorization|auth)/i;
+
+function stripProviderCredentials(value, allowInlineKeys) {
+    if (allowInlineKeys) return value;
+    if (Array.isArray(value)) return value.map((v) => stripProviderCredentials(v, false));
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const [key, val] of Object.entries(value)) {
+            if (CREDENTIAL_KEY_RE.test(key)) continue;
+            out[key] = stripProviderCredentials(val, false);
+        }
+        return out;
+    }
+    return value;
+}
+
+// Keys that define *model access* only. Everything else in the operator's real
+// global config (instructions, agents, modes, commands, plugins, MCP, themes,
+// sharing, keybinds, ...) is deliberately dropped so no local environment
+// leaks into client requests.
+const JAIL_CONFIG_WHITELIST = ['provider', 'model', 'small_model', 'disabled_providers', 'enabled_providers'];
+
+function extractJailProviderConfig(realConfig) {
+    if (!realConfig || typeof realConfig !== 'object') return {};
+    const out = {};
+    for (const key of JAIL_CONFIG_WHITELIST) {
+        if (realConfig[key] !== undefined) out[key] = realConfig[key];
+    }
+    return out;
+}
+
+// The proxy itself runs with the operator's REAL environment; use it to locate
+// the real global opencode config (source of provider/model definitions).
+// OPENCODE_PROXY_REAL_HOME is a debug/test escape hatch.
+function resolveRealHome() {
+    return process.env.OPENCODE_PROXY_REAL_HOME || process.env.USERPROFILE || os.homedir();
+}
+
+function resolveRealConfigDir() {
+    return path.join(resolveRealHome(), '.config', 'opencode');
+}
+
+function resolveRealDataDir() {
+    return path.join(resolveRealHome(), '.local', 'share', 'opencode');
+}
+
+function readRealGlobalConfig() {
+    try {
+        const configPath = path.join(resolveRealConfigDir(), 'opencode.json');
+        if (!fs.existsSync(configPath)) return null;
+        return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    } catch (err) {
+        console.warn(`[Proxy] Could not read real global opencode config for provider whitelist: ${err.message}`);
+        return null;
+    }
+}
+
+/**
+ * Build a fully sandboxed opencode environment (dirs on disk + child env) or,
+ * for isolation === 'none', a passthrough env that keeps the real user home.
+ *
+ * Returns { jailRoot, fakeHome, workspace, envVars, usePure, configPath }.
+ * Exported for unit testing.
+ */
+export function buildJailEnvironment({ isolation, jailInlineKeys, promptMode }) {
+    const jailRoot = path.join(os.tmpdir(), 'opencode-proxy-jail', Math.random().toString(36).substring(7));
+    const fakeHome = path.join(jailRoot, 'fake-home');
+    const workspace = path.join(jailRoot, 'empty-workspace');
+    fs.mkdirSync(workspace, { recursive: true });
+
+    let envVars = { ...process.env, OPENCODE_PROJECT_DIR: workspace };
+
+    if (isolation === 'none') {
+        console.log('[Proxy] Using real HOME for OpenCode (isolation disabled)');
+        return { jailRoot, fakeHome, workspace, envVars, usePure: false, configPath: null };
+    }
+
+    const configDir = path.join(fakeHome, '.config', 'opencode');
+    const dataDir = path.join(fakeHome, '.local', 'share', 'opencode');
+    const cacheDir = path.join(fakeHome, '.cache');
+    const storageDir = path.join(dataDir, 'storage');
+    // OPENCODE_CONFIG_DIR expects a directory searched like `.opencode`.
+    const emptyConfigDir = path.join(configDir, 'empty');
+
+    [configDir, emptyConfigDir, storageDir, path.join(storageDir, 'message'), path.join(storageDir, 'session'), cacheDir].forEach((d) => {
+        if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+    });
+
+    // 1) LOCKED jail config: whitelisted provider/model access only.
+    const jailConfig = {
+        $schema: 'https://opencode.ai/config.json',
+        instructions: [],
+        autoupdate: false,
+        snapshot: false,
+        ...extractJailProviderConfig(readRealGlobalConfig())
+    };
+    if (jailConfig.provider) {
+        jailConfig.provider = stripProviderCredentials(jailConfig.provider, jailInlineKeys);
+    }
+    // Legacy plugin-inject prompt mode: also write its empty plugin config.
+    if (promptMode === 'plugin-inject') {
+        const pluginDir = path.join(configDir, 'plugin', 'opencode2api-empty');
+        fs.mkdirSync(pluginDir, { recursive: true });
+        fs.writeFileSync(path.join(pluginDir, 'index.js'), `export const Opencode2apiEmptyPlugin = async () => ({})\nexport default Opencode2apiEmptyPlugin\n`, 'utf8');
+        jailConfig.plugin = [path.join(pluginDir, 'index.js')];
+        jailConfig.theme = 'system';
+    }
+    const configPath = path.join(configDir, 'opencode.json');
+    fs.writeFileSync(configPath, JSON.stringify(jailConfig, null, 2), 'utf8');
+
+    // 2) keep-auth: preserve provider credentials stored in auth.json only.
+    if (isolation === 'keep-auth') {
+        const realAuth = path.join(resolveRealDataDir(), 'auth.json');
+        if (fs.existsSync(realAuth)) {
+            fs.copyFileSync(realAuth, path.join(dataDir, 'auth.json'));
+        }
+    }
+
+    envVars = {
+        ...envVars,
+        HOME: fakeHome,
+        USERPROFILE: fakeHome,
+        // XDG_* point at the BASE dirs; opencode appends `/opencode` under each,
+        // exactly matching `~/.config/opencode` when HOME is redirected.
+        XDG_CONFIG_HOME: path.join(fakeHome, '.config'),
+        XDG_DATA_HOME: path.join(fakeHome, '.local', 'share'),
+        XDG_CACHE_HOME: cacheDir,
+        OPENCODE_CONFIG_DIR: emptyConfigDir,
+        // Defense in depth: pin instructions empty even if some other config
+        // source is merged in.
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({ instructions: [] })
+    };
+
+    console.log(`[Proxy] Using isolated opencode home (${isolation}): ${fakeHome}`);
+    return { jailRoot, fakeHome, workspace, envVars, usePure: promptMode !== 'plugin-inject', configPath };
+}
+
 async function ensureBackend(config) {
     const {
         OPENCODE_SERVER_URL,
         OPENCODE_PATH,
-        USE_ISOLATED_HOME,
+        ISOLATION,
         ZEN_API_KEY,
         OPENCODE_SERVER_PASSWORD,
         MANAGE_BACKEND,
@@ -3061,82 +3227,18 @@ async function ensureBackend(config) {
             } catch (e) { }
         }
 
-        const isWindows = process.platform === 'win32';
-        const useIsolatedHome = typeof USE_ISOLATED_HOME === 'boolean'
-            ? USE_ISOLATED_HOME
-            : String(process.env.OPENCODE_USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
-            process.env.OPENCODE_USE_ISOLATED_HOME === '1';
-
-        // On Windows, don't use isolated fake-home to avoid path issues
-        // On Unix-like systems, use jail for isolation
-        const salt = Math.random().toString(36).substring(7);
-        const jailRoot = path.join(os.tmpdir(), 'opencode-proxy-jail', salt);
-        state.jailRoot = jailRoot;
-        config.OPENCODE_HOME_BASE = jailRoot;
-        const workspace = path.join(jailRoot, 'empty-workspace');
-
-        let envVars;
-        let cwd;
-
-        if (isWindows) {
-            // Windows: use normal user home to avoid opencode storage path issues
-            fs.mkdirSync(workspace, { recursive: true });
-            cwd = workspace;
-            envVars = {
-                ...process.env,
-                OPENCODE_PROJECT_DIR: workspace
-            };
-            console.log('[Proxy] Running on Windows, using standard user home directory');
-        } else {
-            fs.mkdirSync(workspace, { recursive: true });
-            cwd = workspace;
-
-            if (useIsolatedHome) {
-                // Unix-like: use isolated fake-home
-                const fakeHome = path.join(jailRoot, 'fake-home');
-
-                // Create necessary opencode directories
-                const opencodeDir = path.join(fakeHome, '.local', 'share', 'opencode');
-                const storageDir = path.join(opencodeDir, 'storage');
-                const messageDir = path.join(storageDir, 'message');
-                const sessionDir = path.join(storageDir, 'session');
-
-                [fakeHome, opencodeDir, storageDir, messageDir, sessionDir].forEach(d => {
-                    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-                });
-
-                envVars = {
-                    ...process.env,
-                    HOME: fakeHome,
-                    USERPROFILE: fakeHome,
-                    OPENCODE_PROJECT_DIR: workspace
-                };
-
-                if (PROMPT_MODE === 'plugin-inject') {
-                    const configDir = path.join(fakeHome, '.config', 'opencode');
-                    const pluginDir = path.join(configDir, 'plugin', 'opencode2api-empty');
-                    fs.mkdirSync(pluginDir, { recursive: true });
-                    fs.writeFileSync(path.join(pluginDir, 'index.js'), `export const Opencode2apiEmptyPlugin = async () => ({})\nexport default Opencode2apiEmptyPlugin\n`, 'utf8');
-                    fs.writeFileSync(
-                        path.join(configDir, 'opencode.json'),
-                        JSON.stringify({
-                            plugin: [path.join(pluginDir, 'index.js')],
-                            instructions: [],
-                            theme: 'system'
-                        }, null, 2),
-                        'utf8'
-                    );
-                    console.log('[Proxy] Using plugin-inject prompt mode');
-                }
-                console.log('[Proxy] Using isolated home for OpenCode');
-            } else {
-                envVars = {
-                    ...process.env,
-                    OPENCODE_PROJECT_DIR: workspace
-                };
-                console.log('[Proxy] Using real HOME for OpenCode (isolation disabled)');
-            }
-        }
+        // Build the (possibly sandboxed) opencode environment. Paths, locked
+        // jail config, defense-in-depth env overrides, --pure flag.
+        const jail = buildJailEnvironment({
+isolation: ISOLATION,
+            jailInlineKeys: config.JAIL_INLINE_KEYS,
+            promptMode: PROMPT_MODE
+        });
+        state.jailRoot = jail.jailRoot;
+        config.OPENCODE_HOME_BASE = jail.fakeHome;
+        let envVars = jail.envVars;
+        const cwd = jail.workspace;
+        const usePure = jail.usePure;
 
         // Port for the spawned opencode server comes from OPENCODE_SERVER_URL.
         // Parse with URL instead of assuming the "http://host:port" shape.
@@ -3179,6 +3281,9 @@ async function ensureBackend(config) {
         };
 
         const spawnArgs = ['serve', '--port', port, '--hostname', '127.0.0.1'];
+        // --pure disables external plugins; skipped for the legacy
+        // plugin-inject prompt mode which injects its own plugin by design.
+        if (usePure) spawnArgs.push('--pure');
         state.process = spawn(opencodeBin, spawnArgs, spawnOptions);
 
         // Handle spawn errors
@@ -3252,12 +3357,18 @@ export function startProxy(options) {
         OPENCODE_SERVER_PASSWORD: options.OPENCODE_SERVER_PASSWORD || process.env.OPENCODE_SERVER_PASSWORD || '',
         OPENCODE_PATH: options.OPENCODE_PATH || 'opencode',
         BIND_HOST: options.BIND_HOST || options.bindHost || process.env.OPENCODE_PROXY_BIND_HOST || '0.0.0.0',
-        USE_ISOLATED_HOME: typeof options.USE_ISOLATED_HOME === 'boolean'
-            ? options.USE_ISOLATED_HOME
-            : String(options.USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
-            options.USE_ISOLATED_HOME === '1' ||
-            String(process.env.OPENCODE_USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
-            process.env.OPENCODE_USE_ISOLATED_HOME === '1',
+        ISOLATION: normalizeIsolation(
+            options.ISOLATION ?? options.isolation ?? process.env.OPENCODE_ISOLATION,
+            typeof options.USE_ISOLATED_HOME === 'boolean'
+                ? options.USE_ISOLATED_HOME
+                : String(options.USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
+                options.USE_ISOLATED_HOME === '1' ||
+                String(process.env.OPENCODE_USE_ISOLATED_HOME || '').toLowerCase() === 'true' ||
+                process.env.OPENCODE_USE_ISOLATED_HOME === '1'
+        ),
+        JAIL_INLINE_KEYS: normalizeBool(options.JAIL_INLINE_KEYS) ??
+            normalizeBool(process.env.OPENCODE_JAIL_INLINE_KEYS) ??
+            false,
         REQUEST_TIMEOUT_MS: Number(options.REQUEST_TIMEOUT_MS || process.env.OPENCODE_PROXY_REQUEST_TIMEOUT_MS || DEFAULT_REQUEST_TIMEOUT_MS),
         MANAGE_BACKEND: normalizeBool(options.MANAGE_BACKEND) ??
             normalizeBool(process.env.OPENCODE_PROXY_MANAGE_BACKEND) ??
@@ -3328,8 +3439,9 @@ export function startProxy(options) {
             if (state && state.process) {
                 state.process.kill();
             }
-            // Cleanup temp dir (only on non-Windows where we use jail)
-            if (state && state.jailRoot && process.platform !== 'win32') {
+            // Cleanup temp jail (all platforms: the backend is sandboxed
+            // everywhere now, unless isolation was disabled).
+            if (state && state.jailRoot) {
                 try {
                     fs.rmSync(state.jailRoot, { recursive: true, force: true });
                 } catch (e) { }

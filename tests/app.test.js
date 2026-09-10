@@ -1,5 +1,7 @@
 import request from 'supertest';
 import { jest } from '@jest/globals';
+import fs from 'fs';
+import path from 'path';
 import { buildExternalToolRegistry } from '../src/tool-runtime/registry.js';
 import { normalizeExternalToolChoice, buildToolExposure } from '../src/tool-runtime/router.js';
 import { evaluateToolPolicy } from '../src/tool-runtime/policy.js';
@@ -131,7 +133,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
     }))
 }));
 
-const { createApp } = await import('../src/proxy.js');
+const { createApp, buildJailEnvironment, normalizeIsolation } = await import('../src/proxy.js');
 
 describe('Proxy OpenAI API', () => {
     let app;
@@ -2354,5 +2356,140 @@ describe('Proxy model name resolution (multiple "/")', () => {
         expect(res.statusCode).toEqual(404);
         // The split must preserve "model/submodel" instead of truncating to "model".
         expect(res.body.message).toContain('vendor/model/submodel');
+    });
+});
+
+describe('Sandboxed backend (isolation = "client is the agent")', () => {
+    const origEnv = { ...process.env };
+    const jailRoots = [];
+    let realHome;
+
+    const readRealGlobalConfig = (home) => {
+        const cfgPath = path.join(home, '.config', 'opencode', 'opencode.json');
+        return fs.existsSync(cfgPath) ? JSON.parse(fs.readFileSync(cfgPath, 'utf8')) : null;
+    };
+
+    beforeAll(() => {
+        // Fake "operator real home" that mirrors a real opencode setup: a
+        // provider with an inline apiKey, a plugin, MCP servers and
+        // instructions — none of which may leak into the jail.
+        realHome = fs.mkdtempSync('opencode2api-realhome-');
+        const cfgDir = path.join(realHome, '.config', 'opencode');
+        const dataDir = path.join(realHome, '.local', 'share', 'opencode');
+        fs.mkdirSync(cfgDir, { recursive: true });
+        fs.mkdirSync(dataDir, { recursive: true });
+        fs.writeFileSync(path.join(cfgDir, 'opencode.json'), JSON.stringify({
+            model: 'new-api/deepseek/deepseek-v4-flash',
+            provider: {
+                'new-api': {
+                    models: { 'deepseek/deepseek-v4-flash': { name: 'DeepSeek V4 Flash' } },
+                    options: { baseURL: 'https://example.test/v1' }
+                },
+                mmt: {
+                    options: { apiKey: 'sk-inline-secret-123', baseURL: 'https://mmt.test/v1' }
+                }
+            },
+            plugin: ['@my-org/sneaky-plugin'],
+            mcp: { jira: { type: 'remote', url: 'https://jira.test/mcp' } },
+            instructions: ['CONTRIBUTING.md']
+        }, null, 2));
+        fs.writeFileSync(path.join(dataDir, 'auth.json'), '{"openai": {"key": "sk-auth-456"}}');
+        process.env.OPENCODE_PROXY_REAL_HOME = realHome;
+    });
+
+    afterAll(() => {
+        process.env = origEnv;
+        // Best-effort cleanup of every jail we created.
+        jailRoots.forEach((dir) => {
+            try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { }
+        });
+        try { fs.rmSync(realHome, { recursive: true, force: true }); } catch (e) { }
+    });
+
+    test('full isolation redirects every opencode path into the jail and pins empty instructions', () => {
+        const jail = buildJailEnvironment({ isolation: 'full', jailInlineKeys: false, promptMode: 'standard' });
+        jailRoots.push(jail.jailRoot);
+
+        expect(jail.usePure).toBe(true);
+        expect(jail.envVars.HOME).toBe(jail.fakeHome);
+        expect(jail.envVars.USERPROFILE).toBe(jail.fakeHome);
+        expect(jail.envVars.XDG_CONFIG_HOME).toBe(path.join(jail.fakeHome, '.config'));
+        expect(jail.envVars.XDG_DATA_HOME).toBe(path.join(jail.fakeHome, '.local', 'share'));
+        expect(jail.envVars.XDG_CACHE_HOME).toBe(path.join(jail.fakeHome, '.cache'));
+        expect(jail.envVars.OPENCODE_PROJECT_DIR).toBe(jail.workspace);
+        // Defense in depth.
+        expect(jail.envVars.OPENCODE_CONFIG_DIR).toBe(path.join(jail.fakeHome, '.config', 'opencode', 'empty'));
+        expect(JSON.parse(jail.envVars.OPENCODE_CONFIG_CONTENT)).toEqual({ instructions: [] });
+
+        // The jail config is locked: instructions empty, autoupdate/snapshot off,
+        // and no plugin/MCP/instructions from the real home.
+        const jailConfig = readRealGlobalConfig(jail.fakeHome);
+        expect(jailConfig.instructions).toEqual([]);
+        expect(jailConfig.autoupdate).toBe(false);
+        expect(jailConfig.snapshot).toBe(false);
+        expect(jailConfig.plugin).toBeUndefined();
+        expect(jailConfig.mcp).toBeUndefined();
+        // Provider/model access IS preserved...
+        expect(jailConfig.provider['new-api'].options.baseURL).toBe('https://example.test/v1');
+        expect(jailConfig.model).toBe('new-api/deepseek/deepseek-v4-flash');
+        // ...but inline credentials are stripped out of the jail file.
+        expect(jailConfig.provider.mmt.options.apiKey).toBeUndefined();
+        expect(JSON.stringify(jailConfig)).not.toContain('sk-inline-secret-123');
+
+        // verify the operator's home itself is untouched.
+        expect(fs.existsSync(path.join(realHome, '.config', 'opencode', 'opencode.json'))).toBe(true);
+    });
+
+    test('keep-auth copies auth.json but still fails over to full isolation otherwise', () => {
+        const jail = buildJailEnvironment({ isolation: 'keep-auth', jailInlineKeys: false, promptMode: 'standard' });
+        jailRoots.push(jail.jailRoot);
+
+        expect(jail.usePure).toBe(true);
+        const jailedAuth = path.join(jail.fakeHome, '.local', 'share', 'opencode', 'auth.json');
+        expect(fs.existsSync(jailedAuth)).toBe(true);
+        expect(fs.readFileSync(jailedAuth, 'utf8')).toContain('sk-auth-456');
+        // Non-auth settings still do NOT leak.
+        const jailConfig = readRealGlobalConfig(jail.fakeHome);
+        expect(jailConfig.mcp).toBeUndefined();
+    });
+
+    test('jailInlineKeys=true keeps provider apiKey in the jail (explicit opt-in)', () => {
+        const jail = buildJailEnvironment({ isolation: 'full', jailInlineKeys: true, promptMode: 'standard' });
+        jailRoots.push(jail.jailRoot);
+
+        const jailConfig = readRealGlobalConfig(jail.fakeHome);
+        expect(jailConfig.provider.mmt.options.apiKey).toBe('sk-inline-secret-123');
+    });
+
+    test('plugin-inject prompt mode writes its plugin config and disables --pure', () => {
+        const jail = buildJailEnvironment({ isolation: 'full', jailInlineKeys: false, promptMode: 'plugin-inject' });
+        jailRoots.push(jail.jailRoot);
+
+        const jailConfig = readRealGlobalConfig(jail.fakeHome);
+        expect(Array.isArray(jailConfig.plugin)).toBe(true);
+        expect(jailConfig.instructions).toEqual([]);
+        expect(jail.usePure).toBe(false);
+    });
+
+    test('isolation=none keeps the real user home and never touches config dirs', () => {
+        const jail = buildJailEnvironment({ isolation: 'none', jailInlineKeys: false, promptMode: 'standard' });
+        jailRoots.push(jail.jailRoot);
+
+        expect(jail.usePure).toBe(false);
+        expect(jail.configPath).toBeNull();
+        // Real env is passed through unchanged (explicitly NOT redirected to the jail).
+        expect(jail.envVars.HOME ?? undefined).not.toBe(jail.fakeHome);
+        expect(jail.envVars.USERPROFILE ?? undefined).not.toBe(jail.fakeHome);
+        expect(jail.envVars.XDG_CONFIG_HOME ?? undefined).not.toBe(path.join(jail.fakeHome, '.config'));
+        expect(jail.envVars.OPENCODE_PROJECT_DIR).toBe(jail.workspace);
+    });
+
+    test('default isolation is keep-auth so local /connect credentials are reused', () => {
+        expect(normalizeIsolation(undefined, undefined)).toBe('keep-auth');
+        expect(normalizeIsolation('', undefined)).toBe('keep-auth');
+        expect(normalizeIsolation('keep-auth', false)).toBe('keep-auth');
+        expect(normalizeIsolation('full', undefined)).toBe('full');
+        expect(normalizeIsolation(undefined, true)).toBe('full');
+        expect(normalizeIsolation(undefined, false)).toBe('none');
     });
 });

@@ -2419,14 +2419,25 @@ describe('Sandboxed backend (isolation = "client is the agent")', () => {
         expect(jail.envVars.OPENCODE_PROJECT_DIR).toBe(jail.workspace);
         // Defense in depth.
         expect(jail.envVars.OPENCODE_CONFIG_DIR).toBe(path.join(jail.fakeHome, '.config', 'opencode', 'empty'));
-        expect(JSON.parse(jail.envVars.OPENCODE_CONFIG_CONTENT)).toEqual({ instructions: [] });
+        expect(JSON.parse(jail.envVars.OPENCODE_CONFIG_CONTENT)).toEqual({
+            instructions: [],
+            agent: {
+                title: { disable: true },
+                summary: { disable: true }
+            }
+        });
 
         // The jail config is locked: instructions empty, autoupdate/snapshot off,
-        // and no plugin/MCP/instructions from the real home.
+        // and no plugin/MCP/instructions from the real home. Title/summary agents
+        // are disabled so session.create() does not fire a second LLM call.
         const jailConfig = readRealGlobalConfig(jail.fakeHome);
         expect(jailConfig.instructions).toEqual([]);
         expect(jailConfig.autoupdate).toBe(false);
         expect(jailConfig.snapshot).toBe(false);
+        expect(jailConfig.agent).toEqual({
+            title: { disable: true },
+            summary: { disable: true }
+        });
         expect(jailConfig.plugin).toBeUndefined();
         expect(jailConfig.mcp).toBeUndefined();
         // Provider/model access IS preserved...

@@ -3045,7 +3045,7 @@ function stripProviderCredentials(value, allowInlineKeys) {
 // global config (instructions, agents, modes, commands, plugins, MCP, themes,
 // sharing, keybinds, ...) is deliberately dropped so no local environment
 // leaks into client requests.
-const JAIL_CONFIG_WHITELIST = ['provider', 'model', 'small_model', 'disabled_providers', 'enabled_providers'];
+const JAIL_CONFIG_WHITELIST = ['provider', 'model', 'disabled_providers', 'enabled_providers'];
 
 function extractJailProviderConfig(realConfig) {
     if (!realConfig || typeof realConfig !== 'object') return {};
@@ -3114,11 +3114,19 @@ export function buildJailEnvironment({ isolation, jailInlineKeys, promptMode }) 
     });
 
     // 1) LOCKED jail config: whitelisted provider/model access only.
+    // Disable OpenCode's hidden title/summary agents. session.create() otherwise
+    // fires a second LLM call (session title, falling back to the main model
+    // when no cheap small_model exists) so one client request looks like two
+    // upstream calls.
     const jailConfig = {
         $schema: 'https://opencode.ai/config.json',
         instructions: [],
         autoupdate: false,
         snapshot: false,
+        agent: {
+            title: { disable: true },
+            summary: { disable: true }
+        },
         ...extractJailProviderConfig(readRealGlobalConfig())
     };
     if (jailConfig.provider) {
@@ -3155,7 +3163,13 @@ export function buildJailEnvironment({ isolation, jailInlineKeys, promptMode }) 
         OPENCODE_CONFIG_DIR: emptyConfigDir,
         // Defense in depth: pin instructions empty even if some other config
         // source is merged in.
-        OPENCODE_CONFIG_CONTENT: JSON.stringify({ instructions: [] })
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+            instructions: [],
+            agent: {
+                title: { disable: true },
+                summary: { disable: true }
+            }
+        })
     };
 
     console.log(`[Proxy] Using isolated opencode home (${isolation}): ${fakeHome}`);

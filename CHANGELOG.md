@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Backend Isolation ("client is the agent")**: The spawned opencode backend is now sandboxed by default (`OPENCODE_ISOLATION=keep-auth`). Operator-local prompts, skills, agents, plugins, MCP servers and `AGENTS.md` no longer leak into client requests. Provider/model definitions are carried over and the real `auth.json` is copied so locally logged-in models keep working. Inline credentials in jail config are stripped (`full` skips `auth.json`; `none` uses the real home). Windows is no longer exempt. Defense-in-depth: `HOME`/`USERPROFILE`/`XDG_*` redirects, `OPENCODE_CONFIG_DIR`/`OPENCODE_CONFIG_CONTENT` pinning, and `opencode serve --pure`. Legacy `USE_ISOLATED_HOME` still maps `true`→`full` / `false`→`none`.
+- **Backend Isolation ("client is the agent")**: The spawned opencode backend is now sandboxed by default (`OPENCODE_ISOLATION=keep-auth`). Operator-local prompts, skills, agents, plugins, MCP servers and `AGENTS.md` no longer leak into client requests. Provider/model definitions are carried over and the real `auth.json` is copied so locally logged-in models keep working. Inline credentials in jail config are stripped (`full` skips `auth.json`; `none` uses the real home). Windows is no longer exempt. Defense-in-depth: `HOME`/`USERPROFILE`/`XDG_*` redirects, `OPENCODE_CONFIG_DIR`/`OPENCODE_CONFIG_CONTENT` pinning, and `opencode serve --pure`. Legacy `USE_ISOLATED_HOME` still maps `true`→`full` / `false`→`none`. Hidden OpenCode `title`/`summary` agents are disabled in the jail so one client request does not trigger a second upstream LLM call for session titles.
 
 ### Fixed
 

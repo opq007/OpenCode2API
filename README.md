@@ -193,6 +193,7 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 | `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `180000` | 请求超时时间 (毫秒) |
 | `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode 后端地址 |
 | `OPENCODE_SERVER_PASSWORD` | - | OpenCode 后端密码 |
+| `OPENCODE_PROXY_MANAGE_BACKEND` | `true` | 后端不可达时自动启动 `opencode serve`；设为 `false` 则需外部自行管理后端 |
 | `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径 |
 | `OPENCODE_ZEN_API_KEY` | - | Zen API Key 透传 |
 | `DEBUG` / `OPENCODE_PROXY_DEBUG` | `false` | 调试日志 |

@@ -34,7 +34,7 @@ const defaultConfig = {
     API_KEY: '',
     OPENCODE_SERVER_URL: `http://127.0.0.1:${process.env.OPENCODE_SERVER_PORT || 10001}`,
     OPENCODE_SERVER_PASSWORD: process.env.OPENCODE_SERVER_PASSWORD || '',
-    MANAGE_BACKEND: parseBool(process.env.OPENCODE_PROXY_MANAGE_BACKEND, false),
+    MANAGE_BACKEND: parseBool(process.env.OPENCODE_PROXY_MANAGE_BACKEND, true),
     OPENCODE_PATH: 'opencode',
     BIND_HOST: '0.0.0.0',
     DISABLE_TOOLS: true,
@@ -125,6 +125,7 @@ console.log(`  - Bind Host: ${finalConfig.BIND_HOST}`);
 console.log(`  - Backend: ${finalConfig.OPENCODE_SERVER_URL}`);
 console.log(`  - Backend Password: ${finalConfig.OPENCODE_SERVER_PASSWORD ? 'Configured' : 'Not configured'}`);
 console.log(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
+    console.log(`  - Manage Backend: ${finalConfig.MANAGE_BACKEND ? 'Yes (auto-start on demand)' : 'No (backend must run externally)'}`);
 console.log(`  - API Key: ${finalConfig.API_KEY ? 'Configured' : 'Not configured (no auth)'}`);
 console.log(`  - Zen API Key: ${finalConfig.ZEN_API_KEY ? 'Configured' : 'Not configured'}`);
 console.log(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);

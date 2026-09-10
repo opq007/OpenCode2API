@@ -89,8 +89,14 @@ jest.unstable_mockModule('http', () => ({
         get: jest.fn((url, options, callback) => {
             const response = {
                 statusCode: 200,
-                headers: {},
-                on: jest.fn()
+                headers: { 'content-type': 'application/json' },
+                setEncoding: jest.fn(),
+                on: jest.fn((event, handler) => {
+                    // Emit a real backend health response so checkHealth() (which
+                    // parses the JSON body) resolves instead of hanging.
+                    if (event === 'data') handler('{"healthy":true,"version":"test"}');
+                    if (event === 'end') handler();
+                })
             };
 
             callback(response);
@@ -2272,4 +2278,81 @@ describe('Proxy Responses API previous_response_id', () => {
         expect(res.body.error.message).toContain('previous_response_id');
     });
 });
+});
+
+describe('Proxy model name resolution (multiple "/")', () => {
+    let app;
+
+    beforeEach(() => {
+        jest.clearAllMocks();
+        sdkMocks.toolIds.mockResolvedValue({ data: ['web_fetch', 'filesystem', 'bash'] });
+        sdkMocks.sessionMessages.mockImplementation(async () => ([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'Mock response' }]
+            }
+        ]));
+        // A provider whose model ids themselves contain "/".
+        sdkMocks.configProviders.mockResolvedValue({
+            data: {
+                providers: [
+                    {
+                        id: 'nested',
+                        models: {
+                            'sub/model': { name: 'Nested model', release_date: '2025-06-01' },
+                            'plain': { name: 'Plain model', release_date: '2025-06-01' }
+                        }
+                    },
+                    {
+                        id: 'opencode',
+                        models: {
+                            'kimi-k2.5': { name: 'Kimi k2.5', release_date: '2024-01-15' }
+                        }
+                    }
+                ]
+            }
+        });
+        const config = {
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: false,
+            DEBUG: false
+        };
+        app = createApp(config).app;
+    });
+
+    test('resolves a model name containing multiple "/" without truncation', async () => {
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'nested/sub/model',
+                messages: [{ role: 'user', content: 'Hello' }],
+                stream: false
+            });
+
+        expect(res.statusCode).toEqual(200);
+        const lastUpdate = sdkMocks.configUpdate.mock.calls.at(-1)?.[0];
+        expect(lastUpdate?.body?.activeModel).toEqual({ providerID: 'nested', modelID: 'sub/model' });
+        // The echoed model id must keep the full nested name.
+        expect(res.body.model).toBe('nested/sub/model');
+    });
+
+    test('keeps the full model name in the not-found error for unknown providers', async () => {
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'vendor/model/submodel',
+                messages: [{ role: 'user', content: 'Hello' }],
+                stream: false
+            });
+
+        // transformUpstreamError maps "model not found" messages to 404 (pre-existing behavior).
+        expect(res.statusCode).toEqual(404);
+        // The split must preserve "model/submodel" instead of truncating to "model".
+        expect(res.body.message).toContain('vendor/model/submodel');
+    });
 });

@@ -451,9 +451,27 @@ function checkHealth(serverUrl, password = '') {
     return new Promise((resolve, reject) => {
         const headers = buildBackendAuthHeaders(password);
         const options = headers ? { headers } : undefined;
-        const req = http.get(`${serverUrl}/health`, options, (res) => {
-            if (res.statusCode === 200) resolve(true);
-            else reject(new Error(`Status ${res.statusCode}`));
+        // opencode serve exposes its health probe under /global/health and
+        // returns {"healthy":true,"version":"..."} with status 200. The bare
+        // /health path does NOT exist on the backend: it falls through to the
+        // embedded web UI catch-all and can return 200 HTML, which made the
+        // old status-only check report a healthy backend for a broken one.
+        const req = http.get(`${serverUrl}/global/health`, options, (res) => {
+            let body = '';
+            res.setEncoding('utf8');
+            res.on('data', (chunk) => { body += chunk; });
+            res.on('end', () => {
+                if (res.statusCode !== 200) {
+                    return reject(new Error(`Status ${res.statusCode}`));
+                }
+                try {
+                    const parsed = JSON.parse(body);
+                    if (parsed && parsed.healthy === true) resolve(true);
+                    else reject(new Error('Backend reports unhealthy'));
+                } catch (parseError) {
+                    reject(new Error(`Unexpected health response (status ${res.statusCode}, content-type ${res.headers['content-type'] || 'unknown'})`));
+                }
+            });
         });
         req.on('error', (e) => reject(e));
         req.setTimeout(2000, () => {
@@ -595,13 +613,27 @@ export function createApp(config) {
             .replace(/^o(\d)/i, 'o$1');
     };
 
+    // Split a "provider/model" reference on the FIRST "/" only, so model names
+    // that themselves contain "/" (e.g. "vendor/model/submodel") survive. When
+    // no "/" is present the whole string is treated as the model name.
+    const splitModelRef = (modelRef) => {
+        const ref = String(modelRef || '');
+        const slashIndex = ref.indexOf('/');
+        if (slashIndex === -1) return { providerID: null, modelID: ref };
+        return { providerID: ref.slice(0, slashIndex), modelID: ref.slice(slashIndex + 1) };
+    };
+
     const resolveRequestedModel = async (requestedModel) => {
         const providersList = await getProvidersList();
         const models = buildModelsList(providersList);
         const fallbackModel = models[0]?.id || 'opencode/kimi-k2.5-free';
-        let [providerID, modelID] = (requestedModel || fallbackModel).split('/');
-        if (!modelID) {
-            modelID = providerID;
+        let { providerID, modelID } = splitModelRef(requestedModel || fallbackModel);
+        if (providerID === null || !modelID) {
+            if (providerID === null) {
+                modelID = modelID || fallbackModel;
+            } else {
+                modelID = modelID || providerID;
+            }
             providerID = 'opencode';
         }
         const originalModelID = modelID;
@@ -609,7 +641,7 @@ export function createApp(config) {
         const candidateModelIDs = [...new Set([modelID, normalizedModelID].filter(Boolean))];
         const exact = models.find((m) => candidateModelIDs.some((candidate) => m.id === `${providerID}/${candidate}`));
         if (exact) {
-            const [, resolvedModelID] = exact.id.split('/');
+            const resolvedModelID = splitModelRef(exact.id).modelID;
             return {
                 providerID,
                 modelID: resolvedModelID,
@@ -621,7 +653,7 @@ export function createApp(config) {
         const sameProvider = models.filter((m) => m.owned_by === providerID);
         const suffixMatch = sameProvider.find((m) => candidateModelIDs.some((candidate) => m.id.endsWith(`/${candidate}-free`) || m.id.endsWith(`/${candidate}`)));
         if (suffixMatch) {
-            const [, resolvedModelID] = suffixMatch.id.split('/');
+            const resolvedModelID = splitModelRef(suffixMatch.id).modelID;
             return { providerID, modelID: resolvedModelID, models, resolved: suffixMatch.id, aliasFrom: `${providerID}/${originalModelID}` };
         }
         const error = new Error(`Model not found: ${providerID}/${modelID}`);
@@ -3106,8 +3138,16 @@ async function ensureBackend(config) {
             }
         }
 
-        const [, , portStr] = OPENCODE_SERVER_URL.split(':');
-        const port = portStr ? portStr.split('/')[0] : '10001';
+        // Port for the spawned opencode server comes from OPENCODE_SERVER_URL.
+        // Parse with URL instead of assuming the "http://host:port" shape.
+        let port;
+        try {
+            const parsedUrl = new URL(OPENCODE_SERVER_URL);
+            port = parsedUrl.port || '10001';
+        } catch (urlError) {
+            const [, , portStr] = OPENCODE_SERVER_URL.split(':');
+            port = portStr ? portStr.split('/')[0] : '10001';
+        }
         const resolved = resolveOpencodePath(OPENCODE_PATH);
         const opencodeBin = resolved.path || OPENCODE_PATH || OPENCODE_BASENAME;
         if (resolved.path) {
@@ -3115,6 +3155,18 @@ async function ensureBackend(config) {
         } else {
             console.warn(`[Proxy] Unable to resolve OpenCode binary for '${OPENCODE_PATH}'. Using as-is.`);
         }
+
+        // opencode serve has no --password CLI flag: the server password is read
+        // from the OPENCODE_SERVER_PASSWORD env var only. Inject the configured
+        // password explicitly so a config.json-only password still protects the
+        // spawned backend (otherwise the health probe would 401). The upstream
+        // provider key (ZEN_API_KEY) is injected via OPENCODE_API_KEY, the env
+        // var opencode's Zen provider reads.
+        envVars = {
+            ...envVars,
+            ...(OPENCODE_SERVER_PASSWORD ? { OPENCODE_SERVER_PASSWORD } : {}),
+            ...(ZEN_API_KEY ? { OPENCODE_API_KEY: ZEN_API_KEY } : {})
+        };
 
         // Cross-platform spawn options
         const useShell = process.platform === 'win32' || !resolved.path ||
@@ -3127,9 +3179,6 @@ async function ensureBackend(config) {
         };
 
         const spawnArgs = ['serve', '--port', port, '--hostname', '127.0.0.1'];
-        if (ZEN_API_KEY) {
-            spawnArgs.push('--password', ZEN_API_KEY);
-        }
         state.process = spawn(opencodeBin, spawnArgs, spawnOptions);
 
         // Handle spawn errors

@@ -199,6 +199,8 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 | `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径 |
 | `OPENCODE_ZEN_API_KEY` | - | Zen API Key 透传 |
 | `DEBUG` / `OPENCODE_PROXY_DEBUG` | `false` | 调试日志 |
+| `OPENCODE_PROXY_MAX_CONCURRENCY` | `4` | 最大并发请求数（替代旧的 全局串行锁；编码 Agent 的并行请求不再排队卡死） |
+| `OPENCODE_PROXY_TOOL_INTENT_REPAIR` | `true` | 模型提到工具却未输出可解析 markup 时，自动重问一次修复为真正的 tool call |
 
 > 📄 完整配置参考: [配置详解](./docs/configuration.md)
 

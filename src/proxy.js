@@ -232,9 +232,45 @@ async function getImageDataUri(url) {
     });
 }
 
-// --- Mutex Logic with Timeout ---
-const queue = [];
-let isProcessing = false;
+// --- Concurrency limiting ---
+// The old implementation serialized ALL chat completions through a single global
+// FIFO mutex (concurrency = 1). Coding agents fire many parallel requests (sub-agents,
+// speculative tool prefetch); each queued request waited behind the previous one for
+// up to REQUEST_TIMEOUT_MS before being rejected with "Request timeout". Requests now
+// run concurrently up to MAX_CONCURRENCY (set from startProxy config).
+const REQUEST_CONCURRENCY_DEFAULT = 4;
+let maxConcurrentRequests = REQUEST_CONCURRENCY_DEFAULT;
+let activeRequests = 0;
+const slotWaiters = [];
+
+function acquireSlot() {
+    return new Promise((resolve) => {
+        if (activeRequests < maxConcurrentRequests) {
+            activeRequests += 1;
+            resolve();
+            return;
+        }
+        slotWaiters.push(resolve);
+    });
+}
+
+function releaseSlot() {
+    activeRequests -= 1;
+    const next = slotWaiters.shift();
+    if (next) {
+        activeRequests += 1;
+        next();
+    }
+}
+
+async function withSlot(task) {
+    await acquireSlot();
+    try {
+        return await task();
+    } finally {
+        releaseSlot();
+    }
+}
 
 const STARTUP_WAIT_ITERATIONS = 60;
 const STARTUP_WAIT_INTERVAL_MS = 2000;
@@ -397,47 +433,6 @@ function resolveOpencodePath(requestedPath) {
     return { path: null, source: 'not-found' };
 }
 
-function processQueue() {
-    if (isProcessing || queue.length === 0) return;
-    isProcessing = true;
-    const { task, timeout, resolve, reject } = queue.shift();
-    let settled = false;
-    const timeoutMs = timeout || 120000;
-    const timeoutId = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        reject(new Error(`Request timeout after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    Promise.resolve()
-        .then(() => task())
-        .then((result) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timeoutId);
-            resolve(result);
-        })
-        .catch((err) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timeoutId);
-            reject(err);
-        })
-        .finally(() => {
-            isProcessing = false;
-            if (queue.length > 0) {
-                queueMicrotask(processQueue);
-            }
-        });
-}
-
-function lock(task, timeout = 120000) {
-    return new Promise((resolve, reject) => {
-        queue.push({ task, timeout, resolve, reject });
-        processQueue();
-    });
-}
-
 /**
  * Robust Health Check Helper
  */
@@ -538,6 +533,7 @@ export function createApp(config) {
         METRICS_REQUIRE_AUTH = true,
         PROMPT_MODE,
         OMIT_SYSTEM_PROMPT,
+        TOOL_INTENT_REPAIR = true,
         AUTO_CLEANUP_CONVERSATIONS,
         CLEANUP_INTERVAL_MS,
         CLEANUP_MAX_AGE_MS,
@@ -921,24 +917,39 @@ export function createApp(config) {
 
     const finalizeValidatedToolCalls = (parsedToolCalls, registry) => {
         const { validCalls, invalidCalls } = validateToolCalls(parsedToolCalls, registry);
-        invalidCalls.forEach(({ call, validation }) => {
-            logDebug('Rejected external tool call', {
-                tool: call?.function?.name,
-                errors: validation?.errors?.map((error) => error.message)
-            });
-        });
         const allowedCalls = [];
         validCalls.forEach((toolCall) => {
             const policyDecision = evaluateToolPolicy(toolCall.tool, toolCall.validatedArguments, { config });
-            if (policyDecision.status === 'allow') {
-                allowedCalls.push(toolCall);
+            // Only an explicit operator denylist blocks a call outright.
+            // `require_confirmation` passes through: the calling agent IS the
+            // confirmation surface (it executes tools with its own approval flow).
+            // Blocking here silently degraded the reply to finish_reason 'stop',
+            // which terminated the whole agent loop; e.g. every `Write`-style tool
+            // call was inferred as WRITE/medium-risk and never reached the client.
+            if (policyDecision.status === 'deny') {
+                logDebug('Blocked external tool call', {
+                    tool: toolCall.function.name,
+                    status: policyDecision.status,
+                    reason: policyDecision.reason
+                });
                 return;
             }
-            logDebug('Blocked external tool call', {
-                tool: toolCall.function.name,
-                status: policyDecision.status,
-                reason: policyDecision.reason
+            if (policyDecision.status === 'require_confirmation') {
+                console.warn(`[Proxy] Tool call requires confirmation, passing through to client: ${toolCall.function.name} - ${policyDecision.reason}`);
+            }
+            allowedCalls.push(toolCall);
+        });
+        // Schema-invalid calls pass through as best-effort tool calls. The client
+        // executes them, its tool runner reports the validation error back into the
+        // conversation, and the model self-corrects on the next turn. Silently
+        // dropping them (the old behaviour) turned a recoverable mistake into
+        // finish_reason 'stop' - the agent believed the task was done.
+        invalidCalls.forEach(({ call, validation }) => {
+            logDebug('Passing through invalid external tool call', {
+                tool: call?.function?.name,
+                errors: validation?.errors?.map((error) => error.message)
             });
+            allowedCalls.push({ ...call, validation, passthrough: true });
         });
         return { validCalls: allowedCalls, invalidCalls };
     };
@@ -983,6 +994,57 @@ export function createApp(config) {
             forcedPromptParams.body.tools = toolOverrides;
         }
         await promptWithTimeout(forcedPromptParams, requestTimeoutMs);
+        return pollForAssistantResponse(sessionId, requestTimeoutMs);
+    };
+
+    // --- Tool-intent repair (auto mode) ----------------------------------------
+    //
+    // In `tool_choice: 'auto'` mode a model that intended a tool call but emitted
+    // no parseable markup used to degrade into finish_reason 'stop' with its prose
+    // as content - the calling agent read that as "task complete" and stopped
+    // looping. When the model's raw output MENTIONS a tool name without producing
+    // a call, re-prompt once so the intent becomes a real tool call. The repair
+    // reply may also repeat the final answer, which is treated as "no tool needed"
+    // and the original streamed/prose content stands.
+
+    const escapeRegExpForIntent = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    const toolIntentPresent = (registry, ...texts) => {
+        if (!Array.isArray(registry) || registry.length === 0) return false;
+        const haystack = texts.filter((text) => typeof text === 'string' && text.trim()).join('\n');
+        if (!haystack) return false;
+        return registry.some((tool) => {
+            if (tool.namespacedName && haystack.includes(tool.namespacedName)) return true;
+            if (tool.originalName) {
+                return new RegExp(`\\b${escapeRegExpForIntent(tool.originalName)}\\b`, 'i').test(haystack);
+            }
+            return false;
+        });
+    };
+
+    const createToolIntentRepairRequester = ({
+        sessionId,
+        systemWithGuard,
+        providerID,
+        modelID,
+        toolOverrides,
+        requestTimeoutMs
+    }) => async () => {
+        const repairPromptParams = {
+            path: { id: sessionId },
+            body: {
+                model: { providerID, modelID },
+                ...(systemWithGuard ? { system: systemWithGuard } : {}),
+                parts: [{
+                    type: 'text',
+                    text: 'SYSTEM: Your previous reply mentioned a tool but did not emit a valid <function_calls> block, so the tool call could not be delivered to the client. Reply now with ONLY <function_calls>{"name":"<tool>","arguments":{...}}</function_calls> for the tool you intended - no prose, no markdown, no <think> block. If you actually do not need any tool, repeat your previous final answer unchanged.'
+                }]
+            }
+        };
+        if (toolOverrides && Object.keys(toolOverrides).length > 0) {
+            repairPromptParams.body.tools = toolOverrides;
+        }
+        await promptWithTimeout(repairPromptParams, requestTimeoutMs);
         return pollForAssistantResponse(sessionId, requestTimeoutMs);
     };
 
@@ -1523,7 +1585,7 @@ export function createApp(config) {
     // Chat completions endpoint
     app.post('/v1/chat/completions', async (req, res) => {
         try {
-            await lock(async () => {
+            await withSlot(async () => {
                 let sessionId = null;
                 let eventStream = null;
                 let stream = false;
@@ -1712,16 +1774,9 @@ export function createApp(config) {
                     // Ensure backend is running
                     await ensureBackend(config);
 
-                    // Set active model
-                    try {
-                        await client.config.update({
-                            body: {
-                                activeModel: { providerID: pID, modelID: mID }
-                            }
-                        });
-                    } catch (confError) {
-                        logDebug('Failed to set active model:', confError.message);
-                    }
+                    // NOTE: no client.config.update(activeModel) here. The model is passed
+                    // per-request via session.prompt body.model; a global activeModel write
+                    // races with concurrent requests and can run them on the wrong model.
 
                     // Create session
                     const sessionRes = await client.session.create();
@@ -1769,6 +1824,15 @@ export function createApp(config) {
                         forbidThinkBlock: true
                     });
                     let requestForcedChatToolCall = makeForcedChatToolCallRequester();
+                    const makeToolIntentRepairRequester = () => createToolIntentRepairRequester({
+                        sessionId,
+                        systemWithGuard,
+                        providerID: pID,
+                        modelID: mID,
+                        toolOverrides,
+                        requestTimeoutMs: REQUEST_TIMEOUT_MS
+                    });
+                    let requestToolIntentRepair = makeToolIntentRepairRequester();
 
                     res.setHeader('Content-Type', stream ? 'text/event-stream' : 'application/json');
                     res.setHeader('Cache-Control', 'no-cache');
@@ -1873,6 +1937,7 @@ export function createApp(config) {
                                 if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
                                 promptParams.path.id = sessionId;
                                 requestForcedChatToolCall = makeForcedChatToolCallRequester();
+                                requestToolIntentRepair = makeToolIntentRepairRequester();
                                 streamedContent = '';
                                 streamedReasoning = '';
                                 rawStreamedContent = '';
@@ -2016,6 +2081,25 @@ export function createApp(config) {
                                 );
                             }
                         }
+                        if (
+                            parsedToolCalls.length === 0
+                            && externalToolChoice.mode !== 'none'
+                            && TOOL_INTENT_REPAIR
+                            && toolIntentPresent(externalToolRegistry, rawStreamedReasoning, rawStreamedContent)
+                        ) {
+                            logDebug('Tool intent without parseable markup, requesting repair', { sessionId });
+                            const repaired = await requestToolIntentRepair();
+                            if (repaired) {
+                                const repairedCalls = parseExternalToolCallsFromText(
+                                    externalToolRegistry,
+                                    repaired.reasoning,
+                                    repaired.content
+                                );
+                                if (repairedCalls.length > 0) {
+                                    parsedToolCalls = repairedCalls;
+                                }
+                            }
+                        }
                         const { validCalls: validatedStreamedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
                         const finalStreamedToolCalls = validatedStreamedToolCalls;
                         if (finalStreamedToolCalls.length > 0 && streamedToolCalls.length === 0) {
@@ -2079,6 +2163,7 @@ export function createApp(config) {
                                 if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
                                 promptParams.path.id = sessionId;
                                 requestForcedChatToolCall = makeForcedChatToolCallRequester();
+                                requestToolIntentRepair = makeToolIntentRepairRequester();
                                 await sleep(RETRY_BACKOFF_BASE_MS * attempt);
                             }
                             const attemptStart = Date.now();
@@ -2120,6 +2205,25 @@ export function createApp(config) {
                                 content = forcedResponse.content || content;
                                 reasoning = forcedResponse.reasoning || reasoning;
                                 parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
+                            }
+                        }
+                        if (
+                            parsedToolCalls.length === 0
+                            && externalToolChoice.mode !== 'none'
+                            && TOOL_INTENT_REPAIR
+                            && toolIntentPresent(externalToolRegistry, reasoning, content)
+                        ) {
+                            logDebug('Tool intent without parseable markup, requesting repair', { sessionId });
+                            const repaired = await requestToolIntentRepair();
+                            if (repaired) {
+                                const repairedCalls = parseExternalToolCallsFromText(externalToolRegistry, repaired.reasoning, repaired.content);
+                                if (repairedCalls.length > 0) {
+                                    parsedToolCalls = repairedCalls;
+                                    // The repair reply is a bare tool call; keep the original
+                                    // prose out of the final content.
+                                    content = '';
+                                    reasoning = '';
+                                }
                             }
                         }
                         const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
@@ -2192,7 +2296,7 @@ export function createApp(config) {
                         eventStream.close();
                     }
                 }
-            }, REQUEST_TIMEOUT_MS + 20000);
+            });
         } catch (error) {
             console.error('[Proxy] Request Handler Error:', error.message);
             if (!res.headersSent) {
@@ -2457,11 +2561,8 @@ export function createApp(config) {
 
             await ensureBackend(config);
 
-            try {
-                await client.config.update({
-                    body: { activeModel: { providerID: pID, modelID: mID } }
-                });
-            } catch (e) { }
+            // NOTE: no client.config.update(activeModel); session.prompt carries the
+            // model per-request, so concurrent requests cannot cross models.
 
             // Continue the stored session when chaining from previous_response_id;
             // otherwise start a fresh one.
@@ -2510,6 +2611,14 @@ export function createApp(config) {
                 toolOverrides: await getToolOverridesForMode(toolMode, internalToolContext),
                 requestTimeoutMs: REQUEST_TIMEOUT_MS,
                 forbidThinkBlock: false
+            });
+            const requestToolIntentRepair = createToolIntentRepairRequester({
+                sessionId,
+                systemWithGuard,
+                providerID: pID,
+                modelID: mID,
+                toolOverrides: await getToolOverridesForMode(toolMode, internalToolContext),
+                requestTimeoutMs: REQUEST_TIMEOUT_MS
             });
 
             const promptParams = {
@@ -2919,6 +3028,23 @@ export function createApp(config) {
                     content = forcedResponse.content || content;
                     reasoning = forcedResponse.reasoning || reasoning;
                     parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
+                }
+            }
+            if (
+                parsedToolCalls.length === 0
+                && externalToolChoice.mode !== 'none'
+                && TOOL_INTENT_REPAIR
+                && toolIntentPresent(externalToolRegistry, reasoning, content)
+            ) {
+                logDebug('Tool intent without parseable markup, requesting repair', { sessionId });
+                const repaired = await requestToolIntentRepair();
+                if (repaired) {
+                    const repairedCalls = parseExternalToolCallsFromText(externalToolRegistry, repaired.reasoning, repaired.content);
+                    if (repairedCalls.length > 0) {
+                        parsedToolCalls = repairedCalls;
+                        content = '';
+                        reasoning = '';
+                    }
                 }
             }
             const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
@@ -3423,6 +3549,9 @@ export function startProxy(options) {
             String(process.env.OPENCODE_PROXY_DEBUG || '').toLowerCase() === 'true' ||
             process.env.OPENCODE_PROXY_DEBUG === '1',
         ZEN_API_KEY: options.ZEN_API_KEY || process.env.OPENCODE_ZEN_API_KEY || '',
+        TOOL_INTENT_REPAIR: normalizeBool(options.TOOL_INTENT_REPAIR) ??
+            normalizeBool(process.env.OPENCODE_PROXY_TOOL_INTENT_REPAIR) ??
+            true,
         PROMPT_MODE: promptMode,
         OMIT_SYSTEM_PROMPT: normalizeBool(options.OMIT_SYSTEM_PROMPT) ??
             normalizeBool(process.env.OPENCODE_PROXY_OMIT_SYSTEM_PROMPT) ??

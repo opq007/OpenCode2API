@@ -76,8 +76,10 @@ export function buildExternalToolsReminder(registry, toolChoice = null) {
   const exampleName = normalizedChoice.requiredTool || registry[0].namespacedName;
   return [
     'REMINDER: External tools are called by emitting markup, not through any native tool API.',
-    `To call one, your entire reply must be ONLY <function_calls>{"name":"${exampleName}","arguments":{...}}</function_calls>`,
-    'with no prose, no markdown and no <think> block. Otherwise answer normally.',
+    'If the user\'s request requires any listed tool, you MUST call it NOW - do not describe what you would do, and do not answer in prose.',
+    'To call one, your entire reply must be ONLY:',
+    `<function_calls>{"name":"${exampleName}","arguments":{...}}</function_calls>`,
+    'with no prose, no markdown and no thought block. Multiple calls: emit multiple blocks. When no tool is needed, answer normally.',
     `Available names: ${registry.map((tool) => tool.namespacedName).join(', ')}`
   ].join('\n');
 }

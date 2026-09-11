@@ -2507,6 +2507,26 @@ describe('Sandboxed backend (isolation = "client is the agent")', () => {
         expect(normalizeIsolation(undefined, true)).toBe('full');
         expect(normalizeIsolation(undefined, false)).toBe('none');
     });
+
+    test('agentPersona overrides the jail build agent prompt and config content', () => {
+        const persona = 'You are the model backend of an automated agent harness.';
+        const jail = buildJailEnvironment({ isolation: 'full', jailInlineKeys: false, promptMode: 'standard', agentPersona: persona });
+        jailRoots.push(jail.jailRoot);
+
+        const jailConfig = JSON.parse(fs.readFileSync(jail.configPath, 'utf8'));
+        expect(jailConfig.agent.build.prompt).toBe(persona);
+
+        const configContent = JSON.parse(jail.envVars.OPENCODE_CONFIG_CONTENT);
+        expect(configContent.agent.build.prompt).toBe(persona);
+    });
+
+    test('no agentPersona keeps the jail config free of a build override', () => {
+        const jail = buildJailEnvironment({ isolation: 'full', jailInlineKeys: false, promptMode: 'standard' });
+        jailRoots.push(jail.jailRoot);
+
+        const jailConfig = JSON.parse(fs.readFileSync(jail.configPath, 'utf8'));
+        expect(jailConfig.agent.build).toBeUndefined();
+    });
 });
 
 describe('Agent loop continuity (tool calls must not silently degrade to stop)', () => {

@@ -2266,8 +2266,10 @@ describe('Proxy Responses API previous_response_id', () => {
         expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(1);
         expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
         // Model falls back to the one recorded with the previous response.
-        const lastUpdate = sdkMocks.configUpdate.mock.calls.at(-1)?.[0];
-        expect(lastUpdate?.body?.activeModel).toEqual({ providerID: 'opencode', modelID: 'kimi-k2.5' });
+        // The model is passed per-request on session.prompt; no global activeModel write.
+        expect(sdkMocks.configUpdate).not.toHaveBeenCalled();
+        const lastPrompt = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(lastPrompt?.body?.model).toEqual({ providerID: 'opencode', modelID: 'kimi-k2.5' });
     });
 
     test('rejects an invalid previous_response_id', async () => {
@@ -2336,8 +2338,10 @@ describe('Proxy model name resolution (multiple "/")', () => {
             });
 
         expect(res.statusCode).toEqual(200);
-        const lastUpdate = sdkMocks.configUpdate.mock.calls.at(-1)?.[0];
-        expect(lastUpdate?.body?.activeModel).toEqual({ providerID: 'nested', modelID: 'sub/model' });
+        // The model is passed per-request on session.prompt; no global activeModel write.
+        expect(sdkMocks.configUpdate).not.toHaveBeenCalled();
+        const lastPrompt = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(lastPrompt?.body?.model).toEqual({ providerID: 'nested', modelID: 'sub/model' });
         // The echoed model id must keep the full nested name.
         expect(res.body.model).toBe('nested/sub/model');
     });
@@ -2502,5 +2506,211 @@ describe('Sandboxed backend (isolation = "client is the agent")', () => {
         expect(normalizeIsolation('full', undefined)).toBe('full');
         expect(normalizeIsolation(undefined, true)).toBe('full');
         expect(normalizeIsolation(undefined, false)).toBe('none');
+    });
+});
+
+describe('Agent loop continuity (tool calls must not silently degrade to stop)', () => {
+    let app;
+
+    beforeEach(() => {
+        jest.clearAllMocks();
+        sdkMocks.toolIds.mockResolvedValue({ data: ['web_fetch', 'filesystem', 'bash'] });
+        sdkMocks.sessionMessages.mockImplementation(async () => ([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'Mock response' }]
+            }
+        ]));
+        const config = {
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 5000,
+            DISABLE_TOOLS: false,
+            DEBUG: false
+        };
+        app = createApp(config).app;
+    });
+
+    const baseRequest = (tools) => ({
+        model: 'opencode/kimi-k2.5',
+        messages: [{ role: 'user', content: 'Do the task' }],
+        tools
+    });
+
+    test('a Write-style tool call is not silently blocked by the confirmation policy', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    {
+                        type: 'text',
+                        text: '<function_calls>[{"id":"call_write_1","name":"write_file","arguments":{"path":"a.txt","content":"hello"}}]</function_calls>'
+                    }
+                ]
+            }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send(baseRequest([
+                {
+                    type: 'function',
+                    function: {
+                        name: 'write_file',
+                        description: 'Write a file',
+                        parameters: {
+                            type: 'object',
+                            properties: { path: { type: 'string' }, content: { type: 'string' } },
+                            required: ['path', 'content']
+                        }
+                    }
+                }
+            ]));
+
+        expect(res.statusCode).toEqual(200);
+        // Previously the WRITE side-effect inference set requires_confirmation and
+        // the policy blocked the call, so the agent saw finish_reason 'stop' and
+        // ended the loop mid-task.
+        expect(res.body.choices[0].finish_reason).toEqual('tool_calls');
+        expect(res.body.choices[0].message.tool_calls).toEqual([
+            {
+                id: 'call_write_1',
+                type: 'function',
+                function: {
+                    name: 'write_file',
+                    arguments: JSON.stringify({ path: 'a.txt', content: 'hello' })
+                }
+            }
+        ]);
+    });
+
+    test('a schema-invalid tool call passes through so the agent can self-correct', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    {
+                        type: 'text',
+                        text: '<function_calls>{"name":"external__weather_lookup","arguments":{}}</function_calls>'
+                    }
+                ]
+            }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send(baseRequest([
+                {
+                    type: 'function',
+                    function: {
+                        name: 'weather_lookup',
+                        description: 'Look up weather by city',
+                        parameters: {
+                            type: 'object',
+                            properties: { city: { type: 'string' } },
+                            required: ['city']
+                        }
+                    }
+                }
+            ]));
+
+        expect(res.statusCode).toEqual(200);
+        // Missing required field used to be dropped, degrading to finish_reason
+        // 'stop'. Now it reaches the client whose tool runner will report the
+        // validation error back into the conversation.
+        expect(res.body.choices[0].finish_reason).toEqual('tool_calls');
+        expect(res.body.choices[0].message.tool_calls).toHaveLength(1);
+        expect(res.body.choices[0].message.tool_calls[0].function.name).toEqual('weather_lookup');
+    });
+
+    test('prose that mentions a tool triggers one intent-repair round that yields tool_calls', async () => {
+        sdkMocks.sessionMessages
+            .mockResolvedValueOnce([
+                {
+                    info: { role: 'assistant', finish: 'stop' },
+                    parts: [{ type: 'text', text: 'Let me use web_fetch to fetch the page title for you.' }]
+                }
+            ])
+            .mockResolvedValueOnce([
+                {
+                    info: { role: 'assistant', finish: 'stop' },
+                    parts: [
+                        {
+                            type: 'text',
+                            text: '<function_calls>[{"id":"call_repair_1","name":"external__web_fetch","arguments":{"url":"https://example.com"}}]</function_calls>'
+                        }
+                    ]
+                }
+            ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send(baseRequest([
+                {
+                    type: 'function',
+                    function: {
+                        name: 'web_fetch',
+                        description: 'Fetch a URL',
+                        parameters: {
+                            type: 'object',
+                            properties: { url: { type: 'string' } },
+                            required: ['url']
+                        }
+                    }
+                }
+            ]));
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.choices[0].finish_reason).toEqual('tool_calls');
+        expect(res.body.choices[0].message.tool_calls).toEqual([
+            {
+                id: 'call_repair_1',
+                type: 'function',
+                function: {
+                    name: 'web_fetch',
+                    arguments: JSON.stringify({ url: 'https://example.com' })
+                }
+            }
+        ]);
+        // Two prompts: the original + the intent-repair re-ask.
+        expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(2);
+        const repairPrompt = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(repairPrompt?.body?.parts?.[0]?.text).toContain('did not emit a valid <function_calls> block');
+    });
+
+    test('plain answers without tool intent are not retried', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'The capital of France is Paris.' }]
+            }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send(baseRequest([
+                {
+                    type: 'function',
+                    function: {
+                        name: 'web_fetch',
+                        description: 'Fetch a URL',
+                        parameters: {
+                            type: 'object',
+                            properties: { url: { type: 'string' } },
+                            required: ['url']
+                        }
+                    }
+                }
+            ]));
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.choices[0].finish_reason).toEqual('stop');
+        expect(res.body.choices[0].message.content).toEqual('The capital of France is Paris.');
+        expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(1);
     });
 });

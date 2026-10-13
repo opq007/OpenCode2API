@@ -133,7 +133,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
     }))
 }));
 
-const { createApp, buildJailEnvironment, normalizeIsolation, parseServePureSupport, detectServePureSupport } = await import('../src/proxy.js');
+const { createApp, buildJailEnvironment, normalizeIsolation, parseServePureSupport, detectServePureSupport, readRealGlobalConfig: readRealGlobalConfigFromSrc } = await import('../src/proxy.js');
 
 describe('Proxy OpenAI API', () => {
     let app;
@@ -807,6 +807,85 @@ describe('Proxy OpenAI API', () => {
         expect(res.statusCode).toEqual(200);
         expect(res.body.object).toEqual('list');
         expect(res.body.data[0].id).toEqual('opencode/kimi-k2.5');
+    });
+
+    test('resolves 3-segment model IDs whose provider key contains a slash', async () => {
+        sdkMocks.configProviders.mockResolvedValueOnce({
+            data: {
+                providers: [
+                    {
+                        id: 'monkeycode-ai/monkeycode-basic',
+                        models: { 'qwen3.8-flash': { name: 'Qwen3.8 Flash' } }
+                    }
+                ]
+            }
+        });
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'monkeycode-ai/monkeycode-basic/qwen3.8-flash',
+                messages: [{ role: 'user', content: 'Hello' }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        // The downstream model ref must use the FULL backend provider key,
+        // not the first-slash split ('monkeycode-ai') which would fail.
+        expect(sdkMocks.sessionPrompt.mock.calls[0][0].body.model).toEqual({
+            providerID: 'monkeycode-ai/monkeycode-basic',
+            modelID: 'qwen3.8-flash'
+        });
+    });
+
+    test('resolves a bare model name across providers with slash-containing keys', async () => {
+        sdkMocks.configProviders.mockResolvedValueOnce({
+            data: {
+                providers: [
+                    { id: 'other-vendor', models: { 'other/model-z': { name: 'Model Z' } } }
+                ]
+            }
+        });
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'model-z',
+                messages: [{ role: 'user', content: 'Hello' }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(sdkMocks.sessionPrompt.mock.calls[0][0].body.model).toEqual({
+            providerID: 'other-vendor',
+            modelID: 'other/model-z'
+        });
+    });
+
+    test('model not found error lists available models', async () => {
+        sdkMocks.configProviders.mockResolvedValueOnce({
+            data: {
+                providers: [
+                    { id: 'opencode', models: { 'kimi-k2.5': { name: 'Kimi k2.5' } } }
+                ]
+            }
+        });
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'monkeycode-ai/monkeycode-basic/qwen3.8-flash',
+                messages: [{ role: 'user', content: 'Hello' }]
+            });
+
+        expect(res.statusCode).toEqual(404);
+        // The endpoint sends transformUpstreamError(error).error directly
+        // (no outer {error: ...} wrapper) — existing behavior.
+        expect(res.body.code).toEqual('model_not_found');
+        expect(res.body.message).toContain('Available models');
+        expect(res.body.message).toContain('opencode/kimi-k2.5');
+        expect(res.body.available_models).toEqual(['opencode/kimi-k2.5']);
     });
 
     test('POST /v1/chat/completions returns chat completion', async () => {
@@ -2562,6 +2641,36 @@ describe('Sandboxed backend (isolation = "client is the agent")', () => {
 
         const jailConfig = JSON.parse(fs.readFileSync(jail.configPath, 'utf8'));
         expect(jailConfig.agent.build).toBeUndefined();
+    });
+
+    test('readRealGlobalConfig falls back to opencode.jsonc and legacy config.json', () => {
+        const altHome = fs.mkdtempSync('opencode2api-jsonc-');
+        try {
+            const cfgDir = path.join(altHome, '.config', 'opencode');
+            fs.mkdirSync(cfgDir, { recursive: true });
+
+            // JSONC with comments and trailing commas.
+            fs.writeFileSync(path.join(cfgDir, 'opencode.jsonc'), [
+                '// operator provider',
+                '{',
+                '  "provider": {',
+                '    "vendor-x": { "options": { "baseURL": "https://x.test/v1" } }, // trailing comment',
+                '  },',
+                '}'
+            ].join('\n'));
+            const jsoncConfig = readRealGlobalConfigFromSrc(altHome);
+            expect(jsoncConfig.provider['vendor-x'].options.baseURL).toBe('https://x.test/v1');
+
+            // Legacy config.json is picked up when opencode.json(c) is absent.
+            fs.rmSync(path.join(cfgDir, 'opencode.jsonc'));
+            fs.writeFileSync(path.join(cfgDir, 'config.json'), JSON.stringify({
+                provider: { 'legacy-y': { options: { baseURL: 'https://y.test/v1' } } }
+            }));
+            const legacyConfig = readRealGlobalConfigFromSrc(altHome);
+            expect(legacyConfig.provider['legacy-y'].options.baseURL).toBe('https://y.test/v1');
+        } finally {
+            try { fs.rmSync(altHome, { recursive: true, force: true }); } catch (e) { }
+        }
     });
 });
 

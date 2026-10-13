@@ -624,7 +624,25 @@ export function createApp(config) {
         const providersList = await getProvidersList();
         const models = buildModelsList(providersList);
         const fallbackModel = models[0]?.id || 'opencode/kimi-k2.5-free';
-        let { providerID, modelID } = splitModelRef(requestedModel || fallbackModel);
+        const requested = String(requestedModel || '') || fallbackModel;
+
+        // Provider keys may themselves contain "/" (e.g. "vendor/sub/model"),
+        // so try the raw requested string against full backend model IDs
+        // before splitting into provider/model halves.
+        const rawExact = models.find((m) => m.id === requested);
+        if (rawExact) {
+            return {
+                // owned_by is the REAL backend provider key; splitting the ID
+                // on the first "/" would truncate keys that contain slashes.
+                providerID: rawExact.owned_by,
+                modelID: rawExact.id.slice(rawExact.owned_by.length + 1),
+                models,
+                resolved: rawExact.id,
+                ...(rawExact.id !== requested && { aliasFrom: requested })
+            };
+        }
+
+        let { providerID, modelID } = splitModelRef(requested);
         if (providerID === null || !modelID) {
             if (providerID === null) {
                 modelID = modelID || fallbackModel;
@@ -636,27 +654,37 @@ export function createApp(config) {
         const originalModelID = modelID;
         const normalizedModelID = normalizeModelID(modelID);
         const candidateModelIDs = [...new Set([modelID, normalizedModelID].filter(Boolean))];
+        const matchesSuffix = (m) => candidateModelIDs.some((candidate) => m.id.endsWith(`/${candidate}-free`) || m.id.endsWith(`/${candidate}`));
         const exact = models.find((m) => candidateModelIDs.some((candidate) => m.id === `${providerID}/${candidate}`));
         if (exact) {
-            const resolvedModelID = splitModelRef(exact.id).modelID;
             return {
-                providerID,
-                modelID: resolvedModelID,
+                providerID: exact.owned_by,
+                modelID: exact.id.slice(exact.owned_by.length + 1),
                 models,
                 resolved: exact.id,
-                ...(resolvedModelID !== originalModelID && { aliasFrom: `${providerID}/${originalModelID}` })
+                ...(exact.id !== `${providerID}/${originalModelID}` && { aliasFrom: `${providerID}/${originalModelID}` })
             };
         }
-        const sameProvider = models.filter((m) => m.owned_by === providerID);
-        const suffixMatch = sameProvider.find((m) => candidateModelIDs.some((candidate) => m.id.endsWith(`/${candidate}-free`) || m.id.endsWith(`/${candidate}`)));
+        // Suffix match: prefer the split provider first; fall back to any
+        // provider since provider keys containing "/" make owned_by differ
+        // from the split providerID.
+        const suffixMatch = models.filter((m) => m.owned_by === providerID).find(matchesSuffix)
+            || models.find(matchesSuffix);
         if (suffixMatch) {
-            const resolvedModelID = splitModelRef(suffixMatch.id).modelID;
-            return { providerID, modelID: resolvedModelID, models, resolved: suffixMatch.id, aliasFrom: `${providerID}/${originalModelID}` };
+            return {
+                providerID: suffixMatch.owned_by,
+                modelID: suffixMatch.id.slice(suffixMatch.owned_by.length + 1),
+                models,
+                resolved: suffixMatch.id,
+                aliasFrom: `${providerID}/${originalModelID}`
+            };
         }
-        const error = new Error(`Model not found: ${providerID}/${modelID}`);
+        const available = models.map((m) => m.id);
+        const preview = available.slice(0, 20).join(', ') + (available.length > 20 ? `, ... (+${available.length - 20} more)` : '');
+        const error = new Error(`Model not found: ${providerID}/${modelID}. Available models (${available.length}): ${preview || '(none)'}`);
         error.statusCode = 400;
         error.code = 'model_not_found';
-        error.availableModels = models.map((m) => m.id);
+        error.availableModels = available;
         throw error;
     };
 
@@ -3198,16 +3226,75 @@ function resolveRealDataDir() {
     return path.join(resolveRealHome(), '.local', 'share', 'opencode');
 }
 
-function readRealGlobalConfig() {
-    try {
-        const configPath = path.join(resolveRealConfigDir(), 'opencode.json');
-        if (!fs.existsSync(configPath)) return null;
-        return JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    } catch (err) {
-        console.warn(`[Proxy] Could not read real global opencode config for provider whitelist: ${err.message}`);
-        return null;
+// Strip // and /* */ comments (string-aware) so JSONC config files parse.
+function stripJsonComments(text) {
+    let out = '';
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        const next = text[i + 1];
+        if (inString) {
+            out += ch;
+            if (escaped) escaped = false;
+            else if (ch === '\\') escaped = true;
+            else if (ch === '"') inString = false;
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+            out += ch;
+            continue;
+        }
+        if (ch === '/' && next === '/') {
+            while (i < text.length && text[i] !== '\n') i++;
+            out += '\n';
+            continue;
+        }
+        if (ch === '/' && next === '*') {
+            i += 2;
+            while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+            i++;
+            continue;
+        }
+        out += ch;
     }
+    return out;
 }
+
+function parseOpencodeConfigFile(raw) {
+    try {
+        return JSON.parse(raw);
+    } catch (e) { }
+    // JSONC fallback: comments + trailing commas.
+    const cleaned = stripJsonComments(raw).replace(/,(\s*[}\]])/g, '$1');
+    return JSON.parse(cleaned);
+}
+
+// Provider/model definitions may live in any of the config file names opencode
+// has used across versions: opencode.json (current), opencode.jsonc (JSONC
+// variant), or config.json/config.jsonc (legacy). Read the first one present
+// so the jail whitelist does not silently lose providers defined elsewhere.
+const REAL_CONFIG_FILE_CANDIDATES = ['opencode.json', 'opencode.jsonc', 'config.json', 'config.jsonc'];
+
+function readRealGlobalConfig(homeOverride) {
+    const configDir = homeOverride
+        ? path.join(homeOverride, '.config', 'opencode')
+        : resolveRealConfigDir();
+    for (const fileName of REAL_CONFIG_FILE_CANDIDATES) {
+        const configPath = path.join(configDir, fileName);
+        if (!fs.existsSync(configPath)) continue;
+        try {
+            const parsed = parseOpencodeConfigFile(fs.readFileSync(configPath, 'utf8'));
+            if (parsed && typeof parsed === 'object') return parsed;
+            console.warn(`[Proxy] Real global opencode config ${fileName} is not an object; skipped.`);
+        } catch (err) {
+            console.warn(`[Proxy] Could not read real global opencode config ${fileName} for provider whitelist: ${err.message}`);
+        }
+    }
+    return null;
+}
+export { readRealGlobalConfig };
 
 /**
  * Persona injected as the jail's `build` agent prompt. The opencode runtime prepends

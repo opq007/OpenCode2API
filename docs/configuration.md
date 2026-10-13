@@ -101,7 +101,7 @@ OpenCode2API 的使用模型是：**后端 = 纯净模型路由器，客户端 =
 2. **写入锁定配置** `opencode.json`：`instructions: []`、`autoupdate: false`、`snapshot: false`，并从真实全局配置中**只提取模型访问相关的白名单**（`provider` / `model` / `small_model` / `disabled_providers` / `enabled_providers`）——其余键（指令、agent、MCP、插件、主题……）全部丢弃。
 3. **剥离内联凭据**：jail 配置文件中的 provider `apiKey`/`token`/`secret` 等字段会被移除（防止临时目录中的配置泄露密钥）。凭据默认通过复制本机 `auth.json`（`keep-auth`）和环境变量透传获得。
 4. **纵深防御**：注入 `OPENCODE_CONFIG_DIR`（指向 jail 内空目录）与 `OPENCODE_CONFIG_CONTENT={"instructions":[]}`，确保即使有其他配置源被合并进来，指令也是空的。
-5. **`--pure` 参数**：`opencode serve --pure` 禁用外部插件。
+5. **`--pure` 参数**：`opencode serve --pure` 禁用外部插件。仅当安装的 opencode 版本支持该参数时才会传入——新版 opencode 已从 `serve` 中移除 `--pure`，代理会通过 `opencode serve --help` 自动探测；不支持的版本会跳过该参数（jail 主目录/配置隔离仍然生效，插件隔离不受影响）。
 6. **关闭 title/summary agent**：OpenCode 每次 `session.create()` 都会用隐藏的 title agent 再打一次 LLM（没有 `small_model` 时回落到主模型），导致客户端一次请求看起来像上游调用了两次。jail 配置里默认 `agent.title.disable` / `agent.summary.disable`。
 
 | 级别 | 说明 |

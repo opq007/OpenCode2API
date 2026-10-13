@@ -133,7 +133,7 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
     }))
 }));
 
-const { createApp, buildJailEnvironment, normalizeIsolation } = await import('../src/proxy.js');
+const { createApp, buildJailEnvironment, normalizeIsolation, parseServePureSupport, detectServePureSupport } = await import('../src/proxy.js');
 
 describe('Proxy OpenAI API', () => {
     let app;
@@ -2484,6 +2484,42 @@ describe('Sandboxed backend (isolation = "client is the agent")', () => {
         expect(Array.isArray(jailConfig.plugin)).toBe(true);
         expect(jailConfig.instructions).toEqual([]);
         expect(jail.usePure).toBe(false);
+    });
+
+    test('parseServePureSupport detects --pure only when the binary advertises it', () => {
+        // Newer opencode removed --pure: `serve --help` lists --port/--hostname only.
+        const newHelpOutput = [
+            'DESCRIPTION',
+            '  Start the v2 API and web server',
+            '',
+            'USAGE',
+            '  opencode serve [flags]',
+            '',
+            'FLAGS',
+            '  --hostname string',
+            '  --port integer',
+            '  --cors string        Additional allowed CORS origin (repeat for multiple origins)',
+            '  --service',
+            '  --stdio',
+            '',
+            'GLOBAL FLAGS',
+            '  --help, -h',
+            '  --version, -v'
+        ].join('\n');
+        expect(parseServePureSupport(newHelpOutput)).toBe(false);
+        expect(parseServePureSupport('')).toBe(false);
+        expect(parseServePureSupport(null)).toBe(false);
+
+        // Older opencode advertised the flag.
+        expect(parseServePureSupport('FLAGS\n  --port integer\n  --pure string')).toBe(true);
+        expect(parseServePureSupport('--pure')).toBe(true);
+    });
+
+    test('detectServePureSupport skips --pure when serve --help does not advertise it', async () => {
+        const result = await detectServePureSupport('nonexistent-opencode-binary-for-test');
+        // Probe fails (binary missing) -> must NOT pass the flag: an
+        // unrecognized flag would make newer opencode refuse to start.
+        expect(result).toBe(false);
     });
 
     test('isolation=none keeps the real user home and never touches config dirs', () => {
